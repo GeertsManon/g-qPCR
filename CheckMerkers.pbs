@@ -1,0 +1,97 @@
+#!/bin/bash
+
+#PBS -N missing 
+#PBS -l nodes=1:ppn=1
+#PBS -l walltime=60:00
+#PBS -q hopper
+
+# ===== ATOOLS SCRIPT =====
+#
+# READTHEDOCS : https://atools.readthedocs.io/en/latest/
+#
+# SUBMIT USING :
+# $ module load atools/torque
+# $ n=$(( $(wc -l samples.csv | cut -f1 -d' ') -1 )) 
+# $ qsub -N merkers -t 1-$n CheckMerkers.pbs
+#
+# FOLLOW JOB RUN WITH :
+# $ arange --sniff 1 --log <jobname>log<jobid> --summary
+# $ arange -t1-$n --log <jobname>log<jobid> --summary
+# ( does not work : $ aload --log <jobname>log<jobid> )
+#
+# POST PROCESSING :
+# $ areduce -t 1-$n --pattern "merkers-{PBS_ARRAYID}.tmp" --out merkers.out 
+# $ rm *.tmp
+# $ rm merkers.[oe]<jobid>-*
+#
+# =========================
+
+
+export PATH="/apps/antwerpen/broadwell/centos7/atools/1.4.7-torque/bin/../lib/../bin:${PATH}"
+
+alog --state start
+
+cd "$PBS_O_WORKDIR"
+
+Mini1_F="TGAGGTCTGAGGTACTTCGAAAG|$(./complement.sh TGAGGTCTGAGGTACTTCGAAAG)"
+Mini1_R="TGGATTACTTGGTGTTTTCTATTGATAA|$(./complement.sh TGGATTACTTGGTGTTTTCTATTGATAA)"
+Mini1_P="TTTTCCTGGAGAAAACTGTAT|$(./complement.sh TTTTCCTGGAGAAAACTGTAT)"
+
+Mini2_F="TCTTATGACTGATTTTACGAGAATA|$(./complement.sh TCTTATGACTGATTTTACGAGAATA)"
+Mini2_R="GACATAACAGAGGAAAGTGCTC|$(./complement.sh GACATAACAGAGGAAAGTGCTC)"
+Mini2_P="TTGTGGTAAGAGTGATTTAGTAAT|$(./complement.sh TTGTGGTAAGAGTGATTTAGTAAT)"
+
+Mini3_F="AAACCAACAGAAAGAGATTGCTTA|$(./complement.sh AAACCAACAGAAAGAGATTGCTTA)"
+Mini3_R="ATGGTGATAGAAGTTAGAGATGTGTAG|$(./complement.sh ATGGTGATAGAAGTTAGAGATGTGTAG)"
+Mini3_P="TAGATGTAGTATAAGAATTTAAAAT|$(./complement.sh TAGATGTAGTATAAGAATTTAAAAT)"
+
+TgsGP_F="GAAGCAGTGGGACCTTAGC|$(./complement.sh GAAGCAGTGGGACCTTAGC)"
+TgsGP_R="TTTGTGCTCTTGCTTGCTATTAC|$(./complement.sh TTTGTGCTCTTGCTTGCTATTAC)"
+TgsGP_P="CTCTCCGAACACAGCAGCGACATC|$(./complement.sh CTCTCCGAACACAGCAGCGACATC)"
+
+q18S_F="CGTAGTTGAACTGTGGGCCACGT|$(./complement.sh CGTAGTTGAACTGTGGGCCACGT)"
+q18S_R="ATGCATGACATGCGTGAAAGTGAG|$(./complement.sh ATGCATGACATGCGTGAAAGTGAG)"
+q18S_P="TCGGACGTGTTTTGACCCACGC|$(./complement.sh TCGGACGTGTTTTGACCCACGC)"
+
+GPI_PLC_F="CCCACAACCGTCTCTTTAACC|$(./complement.sh CCCACAACCGTCTCTTTAACC)"
+GPI_PLC_R="GGAGTCGTGCATAAGGGTATTC|$(./complement.sh GGAGTCGTGCATAAGGGTATTC)"
+GPI_PLC_P="ACACCACTTTGTAACCTCTGGCAGT|$(./complement.sh ACACCACTTTGTAACCTCTGGCAGT)"
+
+
+all_probes=($Mini1_F $Mini1_R $Mini1_P \
+		$Mini2_F $Mini2_R $Mini2_P \
+		$Mini3_F $Mini3_R $Mini3_P \
+		$TgsGP_F $TgsGP_R $TgsGP_P \
+		$q18S_F $q18S_R $q18S_P \
+		$GPI_PLC_F $GPI_PLC_R $GPI_PLC_P)
+
+MiniTest_F="TTAGTCGTAAGTTGCAAGAAG|$(./complement.sh TTAGTCGTAAGTTGCAAGAAG)"
+MiniTest_R="TTTCCACATCAAACTACCTTC|$(./complement.sh TTTCCACATCAAACTACCTTC)"
+MiniTest_P="TATTATGGATGGTTATAAAAGGATA|$(./complement.sh TATTATGGATGGTTATAAAAGGATA)"
+
+all_probes=($MiniTest_F $MiniTest_R $MiniTest_P)
+
+source <(aenv --shell bash --data samples.csv --no_sniffer)
+
+
+sample="${name##*/}"
+
+count () {
+  echo "awk '"
+  for p in ${!all_probes[@]}; do echo "/${all_probes[$p]}/{c[$p]++}" ; done
+  echo "END { printf \"%s\", \"$sample\""
+  for p in ${!all_probes[@]} ; do echo "; printf \" %d\", c[$p]" ; done
+  echo "; printf \"\n\" }"
+  echo "'"
+}
+
+gzip -cd rawdata/$sample/*.gz | eval $(count) > $PBS_JOBNAME.tmp 
+
+exit_code=$?
+
+alog --state end  --exit "$exit_code" 
+
+#echo $sample $(cat $sample.tmp.[1-2] | tr '\n' ' ') > $PBS_JOBNAME-$PBS_ARRAYID.tmp
+#rm $sample.tmp.[1-2]
+
+

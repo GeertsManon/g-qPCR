@@ -1,0 +1,110 @@
+#!/bin/bash
+
+#PBS -N cat
+#PBS -L tasks=1:lprocs=28:memory=10gb
+#PBS -l walltime=10:00:00
+#PBS -e ${PBS_JOBNAME##*/}.minicircles.error
+#PBS -o ${PBS_JOBNAME##*/}.minicircles.out
+
+####################################################
+#
+# KOMICS PER SAMPLE
+# =================
+#
+# Description
+#
+# 	a) Retrieving unmapped reads from bam file (maxi)
+#	b) Converting reads to fastq format
+# 	c) Trimming reads
+#	d) Running komics
+#	e) Check quality assembly
+#
+# Usage
+#
+#	$ while read line; do qsub -N $line Komics.pbs; done < samples
+#
+# After job
+#
+#	$ ./concat.sh -t log -o stats/all.kDNA.minicircles.komics.txt
+#	$ ./concat.sh -t "kDNA/minicircles/*.mapping.stats.txt" -o stats/all.kDNA.minicircles.mapping.stats.txt
+#	$ rm kDNA/minicircles/*mapping.stats* rm *log
+#	$ ./Komics.CSBVariations.sh
+#	$ rm -r kDNA/minicircles/tmp.*
+#	$ rm *.minicircles.error *.minicircles.out
+#
+####################################################
+
+cd "$PBS_O_WORKDIR"
+
+
+##### 	0 ENVIRONMENT
+
+# Load modules
+module load leibniz/supported
+module load GATK/4.1.4.1-Java-8-minimal
+module load SAMtools/1.9-intel-2019b
+module load BLAST+/2.10.0-intel-2020a
+module load SMALT/0.7.6-intel-2020a
+module load fastp/0.20.0-intel-2019b
+module load MEGAHIT/1.2.9-intel-2019b
+module load VSEARCH/2.14.2-intel-2019b
+module load BCFtools/1.10.2-intel-2019b
+module load XZ/5.2.4-intel-2018b
+module load PCRE/8.41-GCCcore-7.3.0
+module load libjpeg-turbo/1.5.3-intel-2018b
+module load LMDB/0.9.22-intel-2018b
+module load Python/3.7.1-intel-2018b
+#pip install --user Bio
+
+module list
+
+prefix=kDNA/minicircles
+
+#####	A RETRIEVE
+
+samtools view -b -f 4 -o $prefix/$PBS_JOBNAME.unmapped.bam kDNA/maxicircles/$PBS_JOBNAME.markdup.bam
+echo -e "N_UNM_R: " $(samtools view -c $prefix/$PBS_JOBNAME.unmapped.bam) > $PBS_JOBNAME.log 
+
+
+#####	B CONVERT
+
+gatk SamToFastq -I $prefix/$PBS_JOBNAME.unmapped.bam -F $prefix/$PBS_JOBNAME.reads1.fq.gz -F2 $prefix/$PBS_JOBNAME.reads2.fq.gz
+echo -e "N_FWD_R: " $(gzip -cd $prefix/$PBS_JOBNAME.reads1.fq.gz | grep -c '^@') >> $PBS_JOBNAME.log 
+echo -e "N_REV_R: " $(gzip -cd $prefix/$PBS_JOBNAME.reads2.fq.gz | grep -c '^@') >> $PBS_JOBNAME.log 
+
+
+#####	C TRIM
+
+fastp -i $prefix/$PBS_JOBNAME.reads1.fq.gz -I $prefix/$PBS_JOBNAME.reads2.fq.gz \
+	-o $prefix/$PBS_JOBNAME.reads1.trimmed.fq.gz -O $prefix/$PBS_JOBNAME.reads2.trimmed.fq.gz \
+	-q 30 -u 10 -5 -3 -W 1 -M 30 --cut_right --cut_right_window_size 10 --cut_right_mean_quality 30 -l 100 -b 155
+echo -e "N_FWD_R_tr: " $(gzip -cd $prefix/$PBS_JOBNAME.reads1.trimmed.fq.gz | grep -c '^@') >> $PBS_JOBNAME.log 
+echo -e "N_REV_R_tr: " $(gzip -cd $prefix/$PBS_JOBNAME.reads2.trimmed.fq.gz | grep -c '^@') >> $PBS_JOBNAME.log 
+
+
+#####	D KOMICS ASSEMBLE MINICIRCLES
+
+cd kDNA/minicircles
+CSB3="GGGGTTGGTGT|GGGGTTGATGT|GGGGTTAGTGTA|GGGGGTGGTGTA"
+CSB1="GGGCGTTC|GGGCGTGC|GGGCGTGT"
+komics assemble --threads 10 --kmin 99 --kmax 119 --kstep 10 $PBS_JOBNAME --csb3 $CSB3 \
+	$VSC_SCRATCH/qTgsMSC/$prefix/$PBS_JOBNAME.reads1.trimmed.fq.gz $VSC_SCRATCH/qTgsMSC/$prefix/$PBS_JOBNAME.reads2.trimmed.fq.gz 
+komics circularize $PBS_JOBNAME tmp.$PBS_JOBNAME.csb3contigs.fasta
+komics polish --minidentity 97 --csb1 $CSB1 --csb3 $CSB3 $PBS_JOBNAME tmp.$PBS_JOBNAME.circularized.fasta
+
+echo -e 'N_MC: ' $(grep -c '>' $PBS_JOBNAME.minicircles.fasta) >> $VSC_SCRATCH/qTgsMSC/${PBS_JOBNAME##*/}.log  
+echo -e 'N_MC_circ: ' $(grep -c 'circ' $PBS_JOBNAME.minicircles.fasta) >> $VSC_SCRATCH/qTgsMSC/${PBS_JOBNAME##*/}.log  
+
+
+#####	E QUALITY MC ASSEMBLY
+
+$VSC_SCRATCH/qTgsMSC/fasta_extend.py $PBS_JOBNAME.extended.fasta $PBS_JOBNAME.minicircles.fasta 150
+smalt index -k 5 -s 2 $PBS_JOBNAME.extended.fasta $PBS_JOBNAME.extended.fasta
+smalt map -f sam -y 0.95 -n 10 -x -r 0 -o $PBS_JOBNAME.sam $PBS_JOBNAME.extended.fasta $PBS_JOBNAME.reads1.trimmed.fq.gz $PBS_JOBNAME.reads2.trimmed.fq.gz
+$VSC_SCRATCH/qTgsMSC/mapping_stats.sh $PBS_JOBNAME.sam
+rm *extended* $PBS_JOBNAME.sam *.fai
+
+bcftools mpileup -Ob -f $PBS_JOBNAME.minicircles.fasta $PBS_JOBNAME.sorted.sam | bcftools call -vm -V indels -Ob -o $PBS_JOBNAME.bcf
+echo -e 'N_HomoSNPs: ' $(bcftools view -i $PBS_JOBNAME.bcf | grep -v '#' | grep -c '0/0') >> $VSC_SCRATCH/qTgsMSC/${PBS_JOBNAME##*/}.log
+echo -e 'N_HomoSNPs_QUAL: ' $(bcftools view -i '%QUAL>=20' $PBS_JOBNAME.bcf | grep -v '#' | grep -c '0/0') >> $VSC_SCRATCH/qTgsMSC/${PBS_JOBNAME##*/}.log
+

@@ -1,0 +1,183 @@
+#!/bin/bash
+
+#PBS -N joint.genotyping
+#PBS -L tasks=1:lprocs=28:memory=25gb
+#PBS -l walltime=24:00:00
+#PBS -e $PBS_JOBNAME.error
+#PBS -o $PBS_JOBNAME.out
+
+####################################################
+#
+#
+# JOINT GENOTYPING
+# ================
+#
+# Description
+#
+# 	a) Combine all vcfs
+#	b) Perfom joined genotyping  
+# 	c) Filter variants
+#
+# Usage
+#
+#	$ qsub -N <maxi/nuclear> JointGenotyping.pbs
+#
+# After job
+#
+#	$ ./concat.sh -t summary -o stats/all.<nDNA/kDNA.maxicircles>.summary.variant.filtration.log
+#	$ ./concat.sh -t log -o stats/all.<nDNA/kDNA.maxicircles>.joint.genotyping.log
+#	$ rm <maxi/nuclear>.out <maxi/nuclear>.error *.values
+#
+####################################################
+
+cd "$PBS_O_WORKDIR"
+
+
+##### 	0 ENVIRONMENT
+
+# Load modules
+module load GATK
+module load BCFtools
+module load Python
+module load BCFtools
+module load R
+
+# Set variables
+map=$PBS_JOBNAME
+
+if [[ $map == "maxi" ]]; then
+	REF=reference/maxicircle_Tbrucei_M94286.fa
+	prefix=kDNA/maxicircles
+	DNA=kDNA
+else
+	REF=reference/TriTrypDB-46_TbruceiTREU927_Genome.fasta
+	prefix=nDNA
+	DNA=nDNA
+fi
+
+if [ ! -d $prefix.combined ]; then 
+	mkdir $prefix.combined
+fi
+
+
+#####	 A COMBINE ALL VCFS
+
+ls $prefix/*.g.vcf.gz > list.vcf
+#grep -Ev 'GPAP-CI-82-KP10-29|MCAP-CI-91-BALEA-2|MSUS-CI-78-TSW382' list.vcf > list.filtered.vcf
+allvcf=$(for line in $(cat list.vcf); do echo '--variant ' $line; done)
+gatk CombineGVCFs -R $REF $allvcf  -O $prefix.combined/all.g.vcf.gz
+echo 'N variants: ' $(gzip -cd $prefix.combined/all.g.vcf.gz | \
+	grep -vc '^#') > all.$DNA.joint.genotyping.log
+rm list.vcf
+
+
+#####	B PERFORM JOINT GENOTYPING
+
+gatk GenotypeGVCFs -R $REF --V $prefix.combined/all.g.vcf.gz \
+	-O $prefix.combined/all.genotyped.vcf.gz
+echo 'N genotyped variants: ' $(gzip -cd $prefix.combined/all.genotyped.vcf.gz | \
+	grep -vc '^#') >> all.$DNA.joint.genotyping.log
+
+
+#####	C FILTER VARIANTS
+
+### Select SNPs
+
+gatk SelectVariants -R $REF -V $prefix.combined/all.genotyped.vcf.gz \
+	-select-type SNP -O $prefix.combined/all.genotyped.SNP.vcf.gz
+echo 'N SNPs:' $(gzip -cd $prefix.combined/all.genotyped.SNP.vcf.gz | \
+	grep -vc '^#') >> all.$DNA.joint.genotyping.log
+
+
+### Check value distributions
+
+# FORMAT=<ID=DP,Number=1,Type=Integer,Description="Approximate read depth (reads with MQ=255 or with bad mates are filtered)">
+# INFO=<ID=QD,Number=1,Type=Float,Description="Variant Confidence/Quality by Depth">
+# INFO=<ID=FS,Number=1,Type=Float,Description="Phred-scaled p-value using Fisher's exact test to detect strand bias">
+# INFO=<ID=MQ,Number=1,Type=Float,Description="RMS Mapping Quality">
+# INFO=<ID=MQRankSum,Number=1,Type=Float,Description="Z-score From Wilcoxon rank sum test of Alt vs. Ref read mapping qualities">
+# INFO=<ID=ReadPosRankSum,Number=1,Type=Float,Description="Z-score from Wilcoxon rank sum test of Alt vs. Ref read position bias">
+# cluster-window-size="The window size (in bases) in which to evaluate clustered SNPs"
+
+# print column 8 = INFO
+# print INFO column by replacing ';' by a new line
+# print lines containing selected filter only and print num values only
+
+gzip -cd $prefix.combined/all.genotyped.SNP.vcf.gz | grep -v '^##' | awk '{print $8}' | \
+        awk 'BEGIN{RS=";"}{$1=$1}1' |tee \
+        >(grep 'DP' | sed "s/DP=//g" > DP.values) \
+   	>(grep 'FS' | sed "s/FS=//g" > FS.values) \
+	>(grep -v 'MQRankSum' | grep 'MQ' | sed "s/MQ=//g" > MQ.values) \
+	>(grep 'QD' | sed "s/QD=//g" > QD.values) \
+	>(grep 'MQRankSum' | sed "s/MQRankSum=//g" > MQRankSum.values) \
+	>(grep 'ReadPosRankSum' | sed "s/ReadPosRankSum=//g" > ReadPosRankSum.values) \
+	>/dev/null
+
+# print column 6 = QUAL
+
+gzip -cd $prefix.combined/all.genotyped.SNP.vcf.gz | grep -v '^##' | awk '{print $6}' > QUAL.values
+
+for filter in QUAL DP FS MQ QD MQRankSum ReadPosRankSum; do 
+	./hist.R --f $filter.values --o $prefix.combined/$filter.hist.pdf > $filter.summary
+done
+
+
+### Filter SNPs based on quality
+
+gatk VariantFiltration -R $REF -V $prefix.combined/all.genotyped.SNP.vcf.gz \
+	--filter-expression 'QUAL<500' --filter-name 'LowQual' \
+	--filter-expression 'DP<5' --filter-name 'LowDepth' \
+	--filter-name 'FAIL' --filter-expression 'QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0' \
+	--cluster-window-size 10 \
+	-O $prefix.combined/all.genotyped.SNP.filtered.vcf.gz
+
+gzip -cd $prefix.combined/all.genotyped.SNP.filtered.vcf.gz | \
+	grep '^#\|PASS' | gzip > $prefix.combined/all.genotyped.SNP.filtered.PASS.vcf.gz
+echo 'N filtered SNPs:' $(gzip -cd $prefix.combined/all.genotyped.SNP.filtered.PASS.vcf.gz | \
+	grep -vc '^#') >> all.$DNA.joint.genotyping.log
+
+
+### Filter SNPs where a genotype had been called in every sample
+
+gzip -cd $prefix.combined/all.genotyped.SNP.filtered.PASS.vcf.gz | grep -v '\./\.:' | gzip > $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.vcf.gz
+echo 'N filtered SNPs called in every sample:' \
+	$(gzip -cd $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.vcf.gz | \
+	grep -vc '^#') >> all.$DNA.joint.genotyping.log
+
+
+### Filter bi-allelic SNPs
+
+bcftools view -m 2 -M 2 $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.vcf.gz | \
+	bgzip -c > $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.vcf.gz
+
+echo 'N filtered bi-allelic SNPs called in every sample:' \
+	$(gzip -cd $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.vcf.gz | \
+	grep -vc '^#') >> all.$DNA.joint.genotyping.log
+
+
+### Filter region
+# nuclear = 11 chr
+# maxi = CDS
+
+if [[ $map == "nuclear" ]]; then
+	region="Tb927_01_v5.1,Tb927_02_v5.1,Tb927_03_v5.1,Tb927_04_v5.1,Tb927_05_v5.1,Tb927_06_v5.1,Tb927_07_v5.1,Tb927_08_v5.1,Tb927_09_v5.1,Tb927_10_v5.1,Tb927_11_v5.1"
+else
+	region="M94286.1_Trypanosomabruceibrucei_maxicircle_putativeCDS:1300-16300"
+
+bcftools index $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.vcf.gz
+bcftools view $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.vcf.gz --regions $region | \
+	bgzip -c > $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.region.vcf.gz
+
+echo 'N filtered bi-allelic SNPs within region called in every sample:' \
+	$(gzip -cd $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.region.vcf.gz | \
+	grep -vc '^#') >> all.$DNA.joint.genotyping.log
+fi
+
+### Transform file to fasta & genotype
+
+$VSC_SCRATCH/scripts/vcf2fasta.py $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.region.vcf.gz
+vcftools --gzvcf $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.region.vcf.gz --012 \
+	--out $prefix.combined/all.genotyped.SNP.filtered.PASS.NOMISSING.BI.region.vcf
+
+
+

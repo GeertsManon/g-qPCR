@@ -1,0 +1,160 @@
+#!/bin/bash
+
+#PBS -N cat
+#PBS -L tasks=1:lprocs=28:memory=25gb
+#PBS -l walltime=24:00:00
+#PBS -e ${PBS_JOBNAME##*/}.mapping.VC.error
+#PBS -o ${PBS_JOBNAME##*/}.mapping.VC.out
+
+####################################################
+#
+#
+# INDIVIDUAL MAPPING & VC
+# =======================
+#
+# Description
+#
+# 	a) Index ref genome
+#	b) Map reads & convert to bam 
+# 	c) Calculate depth & coverage
+#	d) Add RG & mark duplicates
+#	e) Calculate mapping stats
+#	f) Call variants
+#
+# Usage
+#	set variable map [nuclear/maxi]
+#	set number of procs
+#	$ while read line; do qsub -N $line MappingAndVariantCalling.pbs; done < samples
+#
+# After job
+#	$ ./concat.sh -t log -o stats/all.<nDNA/kDNA.maxicircles>.mapping.stats.txt
+#	$ rm *mapping.VC.error *mapping.VC.out
+#
+####################################################
+
+cd "$PBS_O_WORKDIR"
+
+
+##### 	0 ENVIRONMENT
+
+# Load modules
+module load SMALT
+module load SAMtools
+module load GATK
+module load Python
+
+# Set variables
+map=maxi
+#map=nuclear
+#map=genes
+Nprocs=28
+
+SAMPLE=${PBS_JOBNAME##*/}
+
+if [[ $map == "maxi" ]]; then
+	REF=reference/maxicircle_Tbrucei_M94286.fa
+	INDEX=reference/M94286
+	prefix=kDNA/maxicircles
+
+	samtools view -b -f 4 -o $prefix/$SAMPLE.unmapped.bam nDNA/$SAMPLE.markdup.bam
+	gatk SamToFastq -I $prefix/$SAMPLE.unmapped.bam -F $prefix/$SAMPLE.reads1.fq.gz -F2 $prefix/$SAMPLE.reads2.fq.gz
+
+	READS1=$prefix/$SAMPLE.reads1.fq.gz
+	READS2=$prefix/$SAMPLE.reads2.fq.gz
+
+elif [[ $map == "genes" ]]; then
+        REF=reference/genes.fasta
+        INDEX=reference/genes
+        READS1=rawdata/$PBS_JOBNAME/*_1.*gz
+        READS2=rawdata/$PBS_JOBNAME/*_2.*gz
+        prefix=genotyping
+
+else
+	REF=reference/TriTrypDB-46_TbruceiTREU927_Genome.fasta
+	INDEX=reference/TbruceiTREU927
+	READS1=rawdata/$PBS_JOBNAME/*_1.*gz
+	READS2=rawdata/$PBS_JOBNAME/*_2.*gz
+	prefix=nDNA
+fi
+
+
+#####	A GENERATE A HASH INDEX FOR THE REFERENCE GENOME
+
+if [ ! -f reference/$INDEX.sma ] || [ ! -f reference/$INDEX.smi ]; then 
+	if [[ $map == "nuclear" ]]; then 
+		smalt index -k 13 -s 2 $INDEX $REF
+	else
+		smalt index -k 6 -s 2 $INDEX $REF
+	fi
+fi
+
+
+#####   B MAP READS TO REFERENCE GENOME & CONVERT TO BAM
+
+if [[ $map == "nuclear" ]]; then 
+        smalt map -i 1500 -y 0.80 -x -r 0 -n $Nprocs -o $prefix/$SAMPLE.sam $INDEX $READS1 $READS2
+else
+        smalt map -y 0.90 -x -n $Nprocs -o $prefix/$SAMPLE.sam $INDEX $READS1 $READS2
+fi
+
+samtools sort -O bam -@ $Nprocs -o $prefix/$SAMPLE.sorted.bam $prefix/$SAMPLE.sam
+rm $prefix/$SAMPLE.sam
+
+
+#####	C CALCULATE DEPTH & COVERAGE
+
+samtools depth -aa $prefix/$SAMPLE.sorted.bam | gzip > $prefix/$SAMPLE.sorted.depth.gz
+python3 coverage.py $prefix/$SAMPLE.sorted.depth.gz > $SAMPLE.log
+
+if [ $map == "nuclear" ]; then
+	samtools depth -a -q 25 -Q 25 $prefix/$SAMPLE.sorted.bam | gzip > $prefix/$SAMPLE.sorted.depth.Q25.gz
+fi
+
+
+#####	D ADD READ GROUPS AND MARK DUPLICATES
+
+BGI="DP8400009737BLL1"
+gatk AddOrReplaceReadGroups -I $prefix/$SAMPLE.sorted.bam -O $prefix/$SAMPLE.sorted.RG.bam \
+	-ID $BGI -PL BGI -LB $SAMPLE -SM $SAMPLE -PU $BGI
+gatk MarkDuplicates -I $prefix/$SAMPLE.sorted.RG.bam -O $prefix/$SAMPLE.markdup.bam \
+	-M $prefix/$SAMPLE.markdup.metrics.txt --READ_NAME_REGEX=null
+samtools index -@ $Nprocs $prefix/$SAMPLE.markdup.bam
+rm $prefix/$SAMPLE.sorted.bam $prefix/$SAMPLE.sorted.RG.bam $prefix/$SAMPLE.markdup.metrics.txt
+
+
+##### 	E CALCULATE MAPPING STATS
+
+file=$prefix/$SAMPLE.markdup.bam
+
+echo "N reads: " $(samtools view -@ $Nprocs -c $file) >> $SAMPLE.log
+echo "N mapped reads: " $(samtools view -@ $Nprocs -c -F 4 $file) >> $SAMPLE.log
+echo "N mapped reads with MQ20: " $(samtools view -@ $Nprocs -c -F 4 -q 20 $file) >> $SAMPLE.log
+echo "N unmapped reads: " $(samtools view -@ $Nprocs -c -f 4 $file) >> $SAMPLE.log
+
+
+#####	F CALL VARIANTS
+
+if [[ $map != "genes" ]]; then
+
+	if [[ $map == "maxi" ]]; then
+		indexfile=$REF.fai
+		dictfile=reference/maxicircle_Tbrucei_M94286.dict
+
+	elif [[ $map == "nuclear" ]]; then
+		indexfile=$REF.fai
+		dictfile=reference/TriTrypDB-46_TbruceiTREU927_Genome.dict
+	fi
+
+	if [ ! -f $dictfile ]; then 
+		gatk CreateSequenceDictionary -R $REF
+	fi
+
+	if [ ! -f $indexfile ]; then
+		samtools faidx $REF
+	fi
+
+	gatk HaplotypeCaller -R $REF -I $prefix/$SAMPLE.markdup.bam -ERC GVCF \
+		--pairHMM AVX_LOGLESS_CACHING_OMP --native-pair-hmm-threads $Nprocs \
+		-O $prefix/$SAMPLE.g.vcf.gz -bamout $prefix/$SAMPLE.vcf.bam
+fi
+
